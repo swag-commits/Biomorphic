@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package biomorphic.v1;
+
+option java_package = "studio.somai.biomorphic.v1";
+option java_outer_classname = "BiomorphicEventProto";
+option go_package = "github.com/somai-studio/biomorphic/schema/v1";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BiomorphicEvent — canonical event schema v1.0
+//
+// This is the public contract for the Biomorphic event spine.
+// Every participant — receptor, Cortex, actor — produces events
+// in exactly this shape. The spine never inspects the payload.
+//
+// APPEND-ONLY: events are never mutated after writing.
+// Actor outcomes are new events with source_type=ACTOR,
+// correlating back to origin via payload.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SourceType identifies which class of participant produced this event.
+// Receptors convert external signals → TRANSACTION, ENTITY, EXTERNAL, DOCUMENT.
+// Cortex writes predictions              → CORTEX.
+// Action centres write outcomes          → ACTOR.
+enum SourceType {
+  // Default / unset — should never appear on the spine in production.
+  SOURCE_TYPE_UNSPECIFIED = 0;
+
+  // Raw signal types — produced by receptors.
+  TRANSACTION = 1;  // Real-time transaction feed
+  ENTITY      = 2;  // Entity state change events
+  EXTERNAL    = 3;  // External signals: feeds, news, market data
+  DOCUMENT    = 4;  // Documents stored in Supabase
+
+  // Intelligence layer — produced by Cortex.
+  CORTEX      = 5;  // Prediction event written to spine in execution mode
+
+  // Action layer — produced by actors.
+  ACTOR       = 6;  // Outcome / decision event, closes the feedback loop
+}
+
+// BiomorphicEvent is the single event type flowing on the spine.
+// All six fields are required. The payload is opaque to the spine.
+message BiomorphicEvent {
+
+  // Unique identifier for this event. UUID v4.
+  // Set by the producing participant at creation time.
+  string event_id = 1;
+
+  // ISO 8601 timestamp. Set by the producing participant.
+  // Example: "2026-06-10T09:41:00.000Z"
+  string timestamp = 2;
+
+  // Which class of participant produced this event.
+  // Determines which Kafka topic this event is routed to.
+  SourceType source_type = 3;
+
+  // UUID identifying the specific receptor, Cortex instance,
+  // or actor that produced this event.
+  // Example: "fraud-receptor-v1", "cortex-prod-1", "aml-actor-v2"
+  string receptor_id = 4;
+
+  // Binary payload. Opaque to the spine and Cortex attention layer.
+  // Receptors encode normalised signal vectors here.
+  // Cortex encodes prediction vectors here.
+  // Actors encode decision + correlation_id here.
+  //
+  // Correlation: actor events encode the event_id of the originating
+  // event inside payload. The spine does not model this structurally —
+  // relational reasoning is handled by Cortex + Supabase.
+  bytes payload = 5;
+
+  // Confidence score assigned by the producing participant.
+  // Receptors: 1.0 for deterministic rules, 0.0–1.0 for RAG/ML.
+  // Cortex:    model certainty for this prediction.
+  // Actors:    confidence in the action taken.
+  float confidence = 6;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Kafka topic routing convention
+//
+// biomorphic.events.transaction   — TRANSACTION events
+// biomorphic.events.entity        — ENTITY events
+// biomorphic.events.external      — EXTERNAL events
+// biomorphic.events.document      — DOCUMENT events
+// biomorphic.events.cortex        — CORTEX prediction events
+// biomorphic.events.actor         — ACTOR outcome events
+//
+// Partition key: receptor_id (consistent routing per producer)
+// ─────────────────────────────────────────────────────────────────────────────
