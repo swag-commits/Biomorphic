@@ -1,0 +1,173 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Biomorphic — local development stack
+#
+# Brings up the full Biomorphic spine in one command:
+#   docker compose up
+#
+# Services:
+#   kafka         — event spine (KRaft mode, no Zookeeper)
+#   kafka-ui      — spine visualiser at http://localhost:8080
+#   supabase-db   — Postgres + pgvector memory layer
+#   supabase-rest — PostgREST API at http://localhost:3000
+#   init          — creates Kafka topics + runs Supabase migration
+#
+# Ports:
+#   9092    Kafka (external)
+#   8080    Kafka UI
+#   5432    Postgres
+#   3000    Supabase REST API
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Kafka (KRaft — no Zookeeper required) ──────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: biomorphic-kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      CLUSTER_ID: "biomorphic-local-cluster-1"
+
+      # KRaft mode
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Listeners
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Topic defaults
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Retention — 30 days default
+      KAFKA_LOG_RETENTION_HOURS: 720
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Kafka UI — visualise the spine at http://localhost:8080 ────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: biomorphic-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: biomorphic-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ── Postgres + pgvector — Supabase memory layer ────────────────────────────
+  supabase-db:
+    image: supabase/postgres:15.1.0.117
+    container_name: biomorphic-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-biomorphic_local}
+      POSTGRES_DB: biomorphic
+    volumes:
+      - supabase-data:/var/lib/postgresql/data
+      # Run migration on first start
+      - ./memory/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d biomorphic"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── PostgREST — REST API over Supabase at http://localhost:3000 ────────────
+  supabase-rest:
+    image: postgrest/postgrest:v12.0.2
+    container_name: biomorphic-rest
+    ports:
+      - "3000:3000"
+    environment:
+      PGRST_DB_URI: postgres://postgres:${POSTGRES_PASSWORD:-biomorphic_local}@supabase-db:5432/biomorphic
+      PGRST_DB_SCHEMA: public
+      PGRST_DB_ANON_ROLE: postgres
+      PGRST_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-token-for-local-dev-only}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+
+  # ── Init — creates Kafka topics after spine is healthy ─────────────────────
+  init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: biomorphic-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo 'Creating Biomorphic event topics...'
+
+      # Signal topics — one per source_type
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic biomorphic.events.transaction \
+        --partitions 6 --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic biomorphic.events.entity \
+        --partitions 6 --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic biomorphic.events.external \
+        --partitions 6 --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic biomorphic.events.document \
+        --partitions 6 --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      # Cortex prediction topic — execution mode
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic biomorphic.events.cortex \
+        --partitions 6 --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      # Actor outcome topic — feedback loop
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+        --topic biomorphic.events.actor \
+        --partitions 6 --replication-factor 1 \
+        --config retention.ms=2592000000
+
+      echo 'Topics created:'
+      kafka-topics --bootstrap-server kafka:9092 --list | grep biomorphic
+
+      echo 'Biomorphic spine ready.'
+      "
+    restart: on-failure
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  kafka-data:
+    driver: local
+  supabase-data:
+    driver: local
